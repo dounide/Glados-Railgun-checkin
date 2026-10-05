@@ -110,7 +110,7 @@ class Config:
     SESSION_COOKIE_NAMES = ("koa:sess", "koa:sess.sig", "gld:sess", "gld:sess.sig")
 
     """默认域名"""
-    DOMAINS = ["glados.cloud", "railgun.info"]
+    DOMAINS = ["glados.cloud"]
 
     """兑换计划列表"""
     EXCHANGE_PLANS = {
