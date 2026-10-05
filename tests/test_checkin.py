@@ -77,6 +77,17 @@ class OfflineTests(unittest.TestCase):
                 request.assert_called_once()
                 self.assertEqual(result["code"], app.CheckinStatus.FAILURE)
 
+    def test_actual_permission_errors_recommend_refresh_without_retry(self):
+        for message in ("没有权限", "No permission"):
+            with self.subTest(message=message):
+                api = self.api()
+                with patch.object(api, "_make_request", return_value=response({"code": -2, "message": message})) as request:
+                    result = api.checkin(COOKIE)
+                request.assert_called_once()
+                self.assertEqual(result["code"], app.CheckinStatus.FAILURE)
+                self.assertIn("鉴权被拒绝", result["message"])
+                self.assertIn("完整 Cookie", result["message"])
+
     def test_other_business_errors_are_not_retried(self):
         api = self.api()
         with patch.object(api, "_make_request", return_value=response({"code": 4, "reason": "other", "loginDevice": "macOS"})) as request:

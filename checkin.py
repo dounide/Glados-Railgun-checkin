@@ -384,6 +384,8 @@ class API:
             result["points"] = "0"
             reason = raw.get("reason", "")
             result["message"] = f"code={code}, message={message}, reason={reason}"
+            if code == -2 and str(message).strip().casefold() in ("没有权限", "no permission"):
+                result["message"] += "；站点登录/会话鉴权被拒绝，请重新登录并更新实际签到请求的完整 Cookie（含新版会话字段）"
             if code == 4 and reason == "device-mismatch":
                 result["message"] += "；设备平台校验失败，请在原登录设备手动签到并更新完整 Cookie"
             self._log("warning", LogEmoji.WARNING, result["message"], force=True)
