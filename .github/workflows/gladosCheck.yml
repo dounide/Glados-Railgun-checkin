@@ -43,6 +43,9 @@ jobs:
         pip install requests
         pip install pypushdeer
 
+    - name: Run offline regression tests
+      run: python -m unittest discover -s tests -v
+
     # 执行 签到脚本
     - name: Running checkin
       run: |
@@ -50,10 +53,12 @@ jobs:
       env:
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+        GLADOS_DOMAINS: ${{ vars.GLADOS_DOMAINS }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
 
     - name: Keep alive
+      if: ${{ always() }}
       uses: liskin/gh-workflow-keepalive@v1 
         
     - name: Delete workflow runs

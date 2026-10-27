@@ -1,5 +1,15 @@
 # Glados自动签到
 
+## 2026-10-27 登录会话与域名配置
+
+默认签到站点为 `glados.space`，与本账号当前浏览器登录站点一致。请从这个站点实际发出的 `/api/user/checkin` 请求复制完整 Cookie，并更新仓库 Actions Secret `GLADOS_COOKIES`。不要将 Cookie 写入源码、普通 Variables 或日志。
+
+若实际使用其他站点，在 Settings → Secrets and variables → Actions → Variables 中设置 `GLADOS_DOMAINS`。支持 `glados.space`、`glados.cloud`、`railgun.info`；留空使用默认站点，多个域名用逗号分隔，只有在已确认会话适用时才配置多个域名。脚本不会自动把 Cookie 轮流尝试到其他域名。
+
+`code=-2 / 没有权限` 表示该站点拒绝当前会话，可能是会话失效或域名不匹配，不能通过改成成功退出解决。更新 Cookie 后，在 Actions → auto check → Run workflow 选择 `master` 验证：应看到“签到成功”或“重复签到”，且无失败任务。默认日志会显示本次获得积分。
+
+计划仍为北京时间每天 12:00、18:00，GitHub 排队可能延迟。积分兑换保留已有显式配置，余额不足或查询失败时不会提交兑换。
+
 ## 食用方式：
 
 ### 注册一个GLaDOS的账号([注册地址](https://glados.space/landing/0A58E-NV28S-6U3QV-33VMG))
@@ -98,4 +108,4 @@
 
 离线测试：`python -m unittest discover -s tests -v`。
 
-**此版本尚未用真实账号验证，更新 Cookie 后需要手动触发 Actions 检查。**
+上述 10 月 5 日记录是历史说明。当前修复和线上验证结果详见 [2026-10-27 修复记录](REPAIR_NOTES-20261027.md)。

@@ -31,8 +31,8 @@ class OfflineTests(unittest.TestCase):
         push.start()
         self.addCleanup(push.stop)
 
-    def api(self):
-        api = app.API("glados.cloud")
+    def api(self, domain="glados.cloud"):
+        api = app.API(domain)
         self.addCleanup(api.close)
         return api
 
@@ -139,6 +139,72 @@ class OfflineTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_SIG", text)
         self.assertEqual(len(config.cookies_list), 1)
 
+    def test_default_and_blank_domains_use_logged_in_site(self):
+        self.assertEqual(app.Config().DOMAINS, ["glados.space"])
+        for value in ("", " \t "):
+            with self.subTest(value=value), patch.dict(os.environ, {"GLADOS_DOMAINS": value}):
+                self.assertEqual(app.Config().DOMAINS, ["glados.space"])
+
+    def test_explicit_domains_are_unique_and_do_not_change_other_instances(self):
+        with patch.dict(os.environ, {
+            "GLADOS_DOMAINS": " RAILGUN.INFO, glados.cloud,RAILGUN.INFO,,GLADOS.SPACE "
+        }):
+            selected = app.Config()
+        self.assertEqual(selected.DOMAINS, ["railgun.info", "glados.cloud", "glados.space"])
+        default = app.Config()
+        selected.DOMAINS.clear()
+        default.DOMAINS.append("railgun.info")
+        self.assertEqual(app.Config().DOMAINS, ["glados.space"])
+
+    def test_invalid_domain_fails_before_constructing_a_checker(self):
+        for value in (
+            ", ,", "https://glados.space", "glados.space/console/checkin",
+            "glados.space.evil.example", "evil.example/glados.space",
+            "glados.space:443", "user@glados.space", "glados.space,evil.example",
+            "glados.space?cookie=PRIVATE_VALUE", "glados.space\nrailgun.info",
+        ):
+            with self.subTest(value=value), patch.dict(os.environ, {"GLADOS_DOMAINS": value}):
+                with patch.object(app, "Checker") as factory, patch.object(app, "PushService") as push:
+                    with self.assertLogs(level="ERROR") as logs:
+                        self.assertEqual(app.main(), 1)
+                    factory.assert_not_called()
+                    push.assert_not_called()
+                    self.assertNotIn("PRIVATE_VALUE", " ".join(logs.output))
+
+    def test_selected_domain_controls_request_and_does_not_fall_back(self):
+        for domain in ("glados.space", "glados.cloud", "railgun.info"):
+            for code, expected in ((0, app.CheckinStatus.SUCCESS), (-2, app.CheckinStatus.FAILURE)):
+                with self.subTest(domain=domain, code=code), patch.dict(os.environ, {"GLADOS_DOMAINS": domain}):
+                    config = app.Config()
+                    reads = [response({"code": 0, "data": {"leftDays": 14}}),
+                             response({"code": 0, "points": 71})]
+                    body = {"code": code, "points": 5, "message": "ok" if code == 0 else "No permission"}
+                    with patch.object(requests.Session, "get", side_effect=reads) as get:
+                        with patch.object(requests.Session, "post", return_value=response(body)) as post:
+                            checker = app.Checker(config)
+                            checker.checkin_all()
+                    post.assert_called_once()
+                    self.assertEqual(post.call_args.args, (f"https://{domain}/api/user/checkin",))
+                    self.assertEqual(post.call_args.kwargs["data"], {"token": domain})
+                    self.assertEqual(post.call_args.kwargs["headers"]["origin"], f"https://{domain}")
+                    self.assertEqual(post.call_args.kwargs["headers"]["cookie"], COOKIE)
+                    self.assertEqual([call.args[0] for call in get.call_args_list], [
+                        f"https://{domain}/api/user/status", f"https://{domain}/api/user/points"
+                    ])
+                    self.assertEqual(len(checker.results), 1)
+                    self.assertEqual(checker.results[0].code, expected)
+                    self.assertEqual(checker.results[0].domain, domain)
+
+    def test_authentication_hint_identifies_the_cookie_source_domain(self):
+        for domain in ("glados.space", "glados.cloud", "railgun.info"):
+            with self.subTest(domain=domain):
+                api = self.api(domain)
+                with patch.object(api, "_make_request", return_value=response({"code": -2, "message": "No permission"})):
+                    result = api.checkin(COOKIE)
+                self.assertIn(f"https://{domain}/console/checkin", result["message"])
+                self.assertIn("GLADOS_DOMAINS", result["message"])
+                self.assertNotIn(COOKIE, result["message"])
+
     def test_default_exchange_disabled_and_explicit_plan_preserved(self):
         self.assertEqual(app.Config().exchange_plan, "none")
         with patch.dict(os.environ, {"GLADOS_EXCHANGE_PLAN": "plan200"}):
@@ -176,6 +242,38 @@ class OfflineTests(unittest.TestCase):
             api.checkin.return_value = {"status": "成功", "code": app.CheckinStatus.SUCCESS}
             app.Checker(config)._checkin_on_domain(COOKIE, 1, "glados.cloud")
             api.exchange.assert_called_once_with(COOKIE, "plan100", 100)
+
+    def test_exchange_balance_threshold_and_failed_points_query(self):
+        for plan, required in (("plan100", 100), ("plan200", 200), ("plan500", 500)):
+            for status in (app.CheckinStatus.SUCCESS, app.CheckinStatus.REPEAT):
+                for balance in (0, required - 1, required):
+                    with self.subTest(plan=plan, status=status, balance=balance):
+                        config = app.Config()
+                        config.exchange_plan = plan
+                        with patch.object(app, "API") as factory:
+                            api = factory.return_value.__enter__.return_value
+                            api.get_status.return_value = ("14 天", 0)
+                            api.get_points.return_value = ("None 积分" if balance == 0 else f"{balance} 积分", balance)
+                            api.checkin.return_value = {"status": "result", "code": status, "points": "5"}
+                            result = app.Checker(config)._checkin_on_domain(COOKIE, 1, "glados.space")
+                            if balance < required:
+                                api.exchange.assert_not_called()
+                                self.assertIn("跳过自动兑换", result.exchange)
+                            else:
+                                api.exchange.assert_called_once_with(COOKIE, plan, required)
+                            self.assertEqual(result.code, status)
+
+    def test_default_success_log_includes_awarded_points_without_cookie(self):
+        config = app.Config()
+        self.assertFalse(config.verbose)
+        checker = app.Checker(config)
+        result = app.CheckinResult(1, "glados.space", status="签到成功", points="7", code=app.CheckinStatus.SUCCESS)
+        with patch.object(checker, "_checkin_on_domain", return_value=result):
+            with self.assertLogs(level="INFO") as logs:
+                checker.checkin_all()
+        output = " ".join(logs.output)
+        self.assertIn("获得 7 积分", output)
+        self.assertNotIn(COOKIE, output)
 
     def test_main_exit_codes(self):
         scenarios = [([], 1), ([app.CheckinStatus.SUCCESS], 0), ([app.CheckinStatus.REPEAT], 0),
