@@ -4,9 +4,10 @@ import logging
 import os
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import requests
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 import checkin as app
 
 COOKIE = "koa:sess=fake; koa:sess.sig=fake; gld:sess=fake; gld:sess.sig=fake"
@@ -30,6 +31,9 @@ class OfflineTests(unittest.TestCase):
         push = patch.object(app.PushDeer, "send_text", side_effect=AssertionError("Live push is forbidden"))
         push.start()
         self.addCleanup(push.stop)
+        sleeper = patch.object(app.time, "sleep")
+        self.sleep = sleeper.start()
+        self.addCleanup(sleeper.stop)
 
     def api(self, domain="glados.cloud"):
         api = app.API(domain)
@@ -128,6 +132,110 @@ class OfflineTests(unittest.TestCase):
         self.assertTrue(retry.is_retry("GET", 503))
         self.assertFalse(retry.is_retry("POST", 503))
         self.assertFalse(retry.is_retry("POST", 429))
+        with self.assertRaises(MaxRetryError):
+            retry.increment(method="POST", url="https://glados.cloud/api/user/exchange",
+                            error=NewConnectionError(None, "offline"))
+
+    def test_transient_http_error_recovers_without_changing_cookie_or_domain(self):
+        for status in (500, 502, 503, 504):
+            with self.subTest(status=status):
+                self.sleep.reset_mock()
+                api = self.api("glados.space")
+                with patch.object(api.session, "post", side_effect=[
+                    response("PRIVATE_BODY", status), response({"code": 0, "points": 6})
+                ]) as post, self.assertLogs(level="WARNING") as logs:
+                    result = api.checkin(COOKIE)
+                self.assertEqual(result["code"], app.CheckinStatus.SUCCESS)
+                self.assertEqual(result["points"], "6")
+                self.assertEqual(post.call_count, 2)
+                self.sleep.assert_called_once_with(20)
+                for attempt in post.call_args_list:
+                    self.assertEqual(attempt.args, ("https://glados.space/api/user/checkin",))
+                    self.assertEqual(attempt.kwargs["headers"]["cookie"], COOKIE)
+                    self.assertEqual(attempt.kwargs["timeout"], (10, 30))
+                self.assertNotIn(COOKIE, " ".join(logs.output))
+                self.assertNotIn("PRIVATE_BODY", " ".join(logs.output))
+                self.assertEqual(api.last_request_error, "")
+                self.assertFalse(api.last_request_retryable)
+
+    def test_persistent_gateway_failure_is_bounded_and_remains_failure(self):
+        api = self.api()
+        with patch.object(api.session, "post", return_value=response("PRIVATE_BODY", 502)) as post:
+            result = api.checkin(COOKIE)
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(self.sleep.call_args_list, [call(20), call(40)])
+        self.assertEqual(result["code"], app.CheckinStatus.FAILURE)
+        self.assertIn("HTTP 502", result["message"])
+        self.assertIn("重试已用尽", result["message"])
+        self.assertNotIn("401/403", result["message"])
+
+    def test_network_recovery_can_report_already_checked_in(self):
+        for error in (requests.Timeout, requests.ConnectionError):
+            with self.subTest(error=error):
+                self.sleep.reset_mock()
+                api = self.api()
+                with patch.object(api.session, "post", side_effect=[
+                    error("PRIVATE_VALUE"), response({"code": 1, "message": "already checked in"})
+                ]) as post, self.assertLogs(level="WARNING") as logs:
+                    result = api.checkin(COOKIE)
+                self.assertEqual(result["code"], app.CheckinStatus.REPEAT)
+                self.assertEqual(result["points"], "0")
+                self.assertEqual(post.call_count, 2)
+                self.sleep.assert_called_once_with(20)
+                self.assertNotIn("PRIVATE_VALUE", " ".join(logs.output))
+
+    def test_non_transient_errors_do_not_retry(self):
+        for item in [response({}, status) for status in (401, 403, 404, 429, 501)] + [
+            response({"code": -2, "message": "No permission"}),
+            response({"code": 4, "reason": "other"}),
+            requests.exceptions.SSLError("certificate error"),
+        ]:
+            with self.subTest(item=item):
+                self.sleep.reset_mock()
+                api = self.api()
+                with patch.object(api.session, "post", side_effect=[item]) as post:
+                    result = api.checkin(COOKIE)
+                self.assertEqual(result["code"], app.CheckinStatus.FAILURE)
+                post.assert_called_once()
+                self.sleep.assert_not_called()
+
+    def test_authentication_failure_after_gateway_error_stops_retrying(self):
+        api = self.api()
+        with patch.object(api.session, "post", side_effect=[
+            response({}, 502), response({"code": -2, "message": "No permission"})
+        ]) as post:
+            result = api.checkin(COOKIE)
+        self.assertEqual(post.call_count, 2)
+        self.sleep.assert_called_once_with(20)
+        self.assertIn("鉴权被拒绝", result["message"])
+
+    def test_device_adaptation_does_not_reset_transient_retry_budget(self):
+        for final, expected in ((response({"code": 0}), app.CheckinStatus.SUCCESS),
+                                (response({}, 502), app.CheckinStatus.FAILURE)):
+            with self.subTest(expected=expected):
+                self.sleep.reset_mock()
+                api = self.api()
+                with patch.object(api.session, "post", side_effect=[
+                    response({}, 502),
+                    response({"code": 4, "reason": "device-mismatch", "loginDevice": "macOS"}),
+                    response({}, 503), final,
+                ]) as post:
+                    result = api.checkin(COOKIE)
+                self.assertEqual(result["code"], expected)
+                self.assertEqual(post.call_count, 4)
+                self.assertEqual(self.sleep.call_args_list, [call(20), call(40)])
+                self.assertEqual(post.call_args.kwargs["headers"]["user-agent"], app.PLATFORM_UA["macOS"])
+
+    def test_exchange_is_not_replayed_on_transient_failure(self):
+        for item in (response({}, 502), requests.Timeout("timeout"), requests.ConnectionError("offline")):
+            with self.subTest(item=item):
+                self.sleep.reset_mock()
+                api = self.api()
+                with patch.object(api.session, "post", side_effect=[item]) as post:
+                    result = api.exchange(COOKIE, "plan100", 100)
+                self.assertEqual(result, "兑换失败")
+                post.assert_called_once()
+                self.sleep.assert_not_called()
 
     def test_cookie_warning_contains_names_not_values(self):
         with patch.dict(os.environ, {"GLADOS_COOKIES": "koa:sess=PRIVATE_VALUE; koa:sess.sig=PRIVATE_SIG"}):
@@ -188,9 +296,10 @@ class OfflineTests(unittest.TestCase):
                     self.assertEqual(post.call_args.kwargs["data"], {"token": domain})
                     self.assertEqual(post.call_args.kwargs["headers"]["origin"], f"https://{domain}")
                     self.assertEqual(post.call_args.kwargs["headers"]["cookie"], COOKIE)
-                    self.assertEqual([call.args[0] for call in get.call_args_list], [
+                    expected_reads = [
                         f"https://{domain}/api/user/status", f"https://{domain}/api/user/points"
-                    ])
+                    ] if code == 0 else []
+                    self.assertEqual([attempt.args[0] for attempt in get.call_args_list], expected_reads)
                     self.assertEqual(len(checker.results), 1)
                     self.assertEqual(checker.results[0].code, expected)
                     self.assertEqual(checker.results[0].domain, domain)
@@ -224,6 +333,10 @@ class OfflineTests(unittest.TestCase):
                     checker = app.Checker(config)
                     result = checker._checkin_on_domain(COOKIE, 1, "glados.cloud")
                     api.exchange.assert_not_called()
+                    self.assertEqual(api.mock_calls[0], call.checkin(COOKIE))
+                    if status == app.CheckinStatus.FAILURE:
+                        api.get_status.assert_not_called()
+                        api.get_points.assert_not_called()
                 self.assertEqual(result.points, "7")
                 self.assertEqual(result.message, "diagnostic")
                 checker.results = [result]

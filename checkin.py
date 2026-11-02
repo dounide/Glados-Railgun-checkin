@@ -2,6 +2,7 @@ import requests
 import json
 import os
 import logging
+import time
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
@@ -217,6 +218,9 @@ class API:
     STATUS_URL = APIEndpoint.STATUS.value
     POINTS_URL = APIEndpoint.POINTS.value
     EXCHANGE_URL = APIEndpoint.EXCHANGE.value
+    REQUEST_TIMEOUT = (10, 30)
+    CHECKIN_RETRY_DELAYS = (20, 40)
+    TRANSIENT_HTTP_STATUSES = frozenset((500, 502, 503, 504))
 
     def __init__(self, domain: str, cookie_index: int = 0, verbose: bool = False):
         self.domain: str = domain
@@ -225,11 +229,15 @@ class API:
         self.headers: Dict[str, str] = self._get_headers()
         self._device_ua_cache: Dict[str, str] = {}
         self.last_request_error = ""
+        self.last_request_retryable = False
         self.session = requests.Session()
         self.session.headers.update(self.headers)
-        # 仅重试幂等查询，避免网络响应丢失时重复执行签到或积分兑换。
+        # 适配器只重试 GET；POST 的连接错误也不得在这里隐式重放。
+        # 每日签到的有限重试由 checkin 控制，积分兑换始终只提交一次。
         retry_strategy = Retry(
-            total=3,
+            total=2,
+            connect=0,
+            other=0,
             backoff_factor=1.0,
             status_forcelist=(429, 500, 502, 503, 504),
             allowed_methods=("GET",),
@@ -287,6 +295,7 @@ class API:
     def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None) -> Optional[requests.Response]:
         """发送 HTTP 请求"""
         self.last_request_error = ""
+        self.last_request_retryable = False
         session_headers = self.headers.copy()
         if user_agent:
             session_headers["user-agent"] = user_agent
@@ -294,21 +303,32 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                response = self.session.post(url, headers=session_headers, data=data, timeout=self.REQUEST_TIMEOUT)
             elif method.upper() == "GET":
-                response = self.session.get(url, headers=session_headers, timeout=(60, 120))
+                response = self.session.get(url, headers=session_headers, timeout=self.REQUEST_TIMEOUT)
             else:
                 self._log("error", LogEmoji.ERROR, f"不支持的 HTTP 方法: {method}", force=True)
                 return None
 
             if not response.ok:
-                self.last_request_error = f"HTTP {response.status_code}；401/403 请检查登录状态或站点限制，429 请稍后再试"
+                status = response.status_code
+                self.last_request_retryable = status in self.TRANSIENT_HTTP_STATUSES
+                if self.last_request_retryable:
+                    hint = "站点服务或网关暂时异常；此响应不能说明 Cookie 失效"
+                elif status in (401, 403):
+                    hint = "请检查登录状态或站点访问限制"
+                elif status == 429:
+                    hint = "请求受到限流，请稍后再试"
+                else:
+                    hint = "站点返回异常 HTTP 状态"
+                self.last_request_error = f"HTTP {status}；{hint}"
                 self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，HTTP {response.status_code}（不输出响应正文，避免泄露账号信息）", force=True)
                 return None
             return response
         except requests.exceptions.RequestException as e:
+            self.last_request_retryable = isinstance(e, (requests.Timeout, requests.ConnectionError)) and not isinstance(e, requests.exceptions.SSLError)
             self.last_request_error = f"网络请求失败（{type(e).__name__}）"
-            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
+            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误（{type(e).__name__}）", force=True)
             return None
 
     def _get_checkin_data(self) -> Dict[str, str]:
@@ -317,26 +337,42 @@ class API:
 
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
-        """执行签到，含设备平台自适应重试"""
+        """每日签到可返回当天已签到；仅对此操作有限重试临时故障。"""
         url = self._get_full_url(self.CHECKIN_URL)
         checkin_data = self._get_checkin_data()
 
         # 起始 UA 优先复用已学得的设备 UA，否则用会话默认 UA
         start_ua = self._device_ua_cache.get("_last") or self.headers.get("user-agent")
 
-        raw = self._checkin_attempt(url, checkin_data, cookies, start_ua)
+        transient_retries = 0
+        device_retried = False
+        attempts = 0
+        while True:
+            attempts += 1
+            raw = self._checkin_attempt(url, checkin_data, cookies, start_ua)
+            if raw is None and self.last_request_retryable:
+                if transient_retries < len(self.CHECKIN_RETRY_DELAYS):
+                    delay = self.CHECKIN_RETRY_DELAYS[transient_retries]
+                    transient_retries += 1
+                    self._log("warning", LogEmoji.WARNING,
+                              f"{self.last_request_error}；{delay} 秒后重试签到 "
+                              f"({transient_retries}/{len(self.CHECKIN_RETRY_DELAYS)})", force=True)
+                    time.sleep(delay)
+                    continue
+                self.last_request_error += f"；签到重试已用尽（共 {attempts} 次请求）"
 
-        # 设备不匹配(code 4)时按服务端 loginDevice 切换 UA 重试一次
-        if raw is not None and raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
-            login_device = raw.get("loginDevice")
-            recover_ua = PLATFORM_UA.get(login_device) if isinstance(login_device, str) else None
-            if recover_ua and recover_ua != start_ua:
-                self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
-                self.headers["user-agent"] = recover_ua
-                self.session.headers["user-agent"] = recover_ua
-                raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
-
-        return self._parse_checkin(raw)
+            # 设备适配最多一次，且不重置临时故障的重试额度。
+            if not device_retried and raw is not None and raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
+                login_device = raw.get("loginDevice")
+                recover_ua = PLATFORM_UA.get(login_device) if isinstance(login_device, str) else None
+                if recover_ua and recover_ua != start_ua:
+                    device_retried = True
+                    self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
+                    start_ua = recover_ua
+                    self.headers["user-agent"] = recover_ua
+                    self.session.headers["user-agent"] = recover_ua
+                    continue
+            return self._parse_checkin(raw)
 
     def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
         """发起一次签到请求并返回解析后的响应体（失败返回 None）"""
@@ -567,18 +603,21 @@ class Checker:
         result = CheckinResult(cookie_idx, domain)
 
         with API(domain, cookie_idx, verbose=self.config.verbose) as api:
-            # 1. 获取状态
-            self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
-            days_str, status_code = api.get_status(cookie)
-            result.days = days_str
-
-            # 2. 签到
+            # 优先签到，避免可选的余额查询阻塞签到。
             self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.points = checkin_result.get("points", "0")
             result.message = checkin_result.get("message", "")
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+
+            if result.code not in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT):
+                result.exchange = "签到失败，跳过状态/积分查询和自动兑换"
+                self._log(cookie_idx, domain, LogEmoji.INFO, result.exchange, force=True)
+                return result
+
+            self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
+            result.days, _ = api.get_status(cookie)
 
             # 3. 获取积分
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
