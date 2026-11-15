@@ -3,6 +3,7 @@ import json
 import os
 import logging
 import time
+from pathlib import Path
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
@@ -436,6 +437,15 @@ class API:
             result["points"] = "0"
             reason = raw.get("reason", "")
             result["message"] = f"code={code}, message={message}, reason={reason}"
+            if code == 5 and reason == "turnstile":
+                result["status"] = "需要网页验证"
+                result["requires_manual_verification"] = True
+                result["message"] = (
+                    "code=5, reason=turnstile；Cloudflare 人机验证未通过，本次未记录签到。"
+                    f"请本人打开 https://{self.domain}/console/checkin 完成验证并在网页签到。"
+                    "这不是 Cookie 过期的证据；固定 Cookie 无法代替一次性验证令牌，"
+                    "反复重跑或更换域名不能解决此验证要求。网页签到成功也不代表之后的定时请求已恢复。"
+                )
             if code == -2 and str(message).strip().casefold() in ("没有权限", "no permission"):
                 result["message"] += (
                     f"；站点登录/会话鉴权被拒绝，请在 https://{self.domain}/console/checkin "
@@ -529,6 +539,7 @@ class CheckinResult:
     points_total: str = "None"
     exchange: str = "未兑换"
     message: str = ""
+    requires_manual_verification: bool = False
     code: CheckinStatus = CheckinStatus.FAILURE  # 0: 成功, 1: 重复, -2: 失败
 
     def to_dict(self) -> Dict[str, Union[str, CheckinStatus]]:
@@ -610,6 +621,7 @@ class Checker:
             result.points = checkin_result.get("points", "0")
             result.message = checkin_result.get("message", "")
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+            result.requires_manual_verification = checkin_result.get("requires_manual_verification", False)
 
             if result.code not in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT):
                 result.exchange = "签到失败，跳过状态/积分查询和自动兑换"
@@ -647,6 +659,30 @@ class Checker:
     def get_results(self) -> List[Dict[str, str]]:
         """获取所有结果"""
         return [result.to_dict() for result in self.results]
+
+    def write_verification_summary(self) -> None:
+        """在 Actions 摘要显示人工处理入口，不写 Cookie 或原始响应。"""
+        affected = [r for r in self.results if r.requires_manual_verification]
+        summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if not affected or not summary_path:
+            return
+        lines = [
+            "## GLaDOS 需要网页验证",
+            "",
+            "Cloudflare Turnstile 验证未通过，以下任务本次没有记录签到。",
+            "请本人在网页完成验证并签到；这不等于 Cookie 已过期。",
+            "网页成功只确认网页路径可用，不代表 GitHub Actions 的定时签到已恢复。",
+            "",
+        ]
+        for result in affected:
+            if result.domain in Config.ALLOWED_DOMAINS:
+                lines.append(f"- 账号序号 {result.cookie_index}：https://{result.domain}/console/checkin")
+        lines.extend(["", "本次任务保留失败状态；请勿把一次性验证令牌保存为长期 Secret。", ""])
+        try:
+            with Path(summary_path).open("a", encoding="utf-8") as summary:
+                summary.write("\n".join(lines))
+        except OSError:
+            logger.warning("无法写入 Actions 验证提示摘要；请查看真实签到步骤中的处理说明。")
 
     def format_results(self) -> Tuple[str, str, str]:
         """格式化结果"""
@@ -700,6 +736,7 @@ def main() -> int:
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
             checker = Checker(config)
             checker.checkin_all()
+            checker.write_verification_summary()
             exit_code = 0 if checker.results and all(
                 r.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT) for r in checker.results
             ) else 1

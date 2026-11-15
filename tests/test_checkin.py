@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import unittest
+import tempfile
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -98,6 +99,55 @@ class OfflineTests(unittest.TestCase):
             result = api.checkin(COOKIE)
         request.assert_called_once()
         self.assertIn("reason=other", result["message"])
+
+    def test_turnstile_requires_manual_verification_without_retry_or_exchange(self):
+        with patch.dict(os.environ, {"GLADOS_EXCHANGE_PLAN": "plan100"}):
+            config = app.Config()
+        checker = app.Checker(config)
+        with patch.object(requests.Session, "post", return_value=response({
+            "code": 5, "reason": "turnstile", "message": "Cloudflare verification failed."
+        })) as post, patch.object(requests.Session, "get") as get:
+            checker.checkin_all()
+        result = checker.results[0]
+        self.assertEqual(result.code, app.CheckinStatus.FAILURE)
+        self.assertEqual(result.status, "需要网页验证")
+        self.assertTrue(result.requires_manual_verification)
+        self.assertIn("https://glados.space/console/checkin", result.message)
+        self.assertIn("本次未记录签到", result.message)
+        post.assert_called_once()
+        get.assert_not_called()
+        self.sleep.assert_not_called()
+
+    def test_unrelated_code_five_is_not_reported_as_turnstile(self):
+        api = self.api()
+        result = api._parse_checkin({"code": 5, "reason": "other", "message": "other"})
+        self.assertFalse(result.get("requires_manual_verification", False))
+        self.assertEqual(result["code"], app.CheckinStatus.FAILURE)
+
+    def test_turnstile_main_fails_and_writes_only_safe_action_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.md"
+            path.write_text("Existing summary\n", encoding="utf-8")
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(path)}):
+                with patch.object(requests.Session, "post", return_value=response({
+                    "code": 5, "reason": "turnstile", "message": "PRIVATE_SERVER_VALUE"
+                })) as post, patch.object(app, "PushService"):
+                    self.assertEqual(app.main(), 1)
+                post.assert_called_once()
+            summary = path.read_text(encoding="utf-8")
+            self.assertTrue(summary.startswith("Existing summary\n"))
+            self.assertIn("https://glados.space/console/checkin", summary)
+            self.assertNotIn(COOKIE, summary)
+            self.assertNotIn("PRIVATE_SERVER_VALUE", summary)
+
+    def test_success_does_not_create_verification_summary(self):
+        checker = app.Checker(app.Config())
+        checker.results = [app.CheckinResult(1, "glados.space", code=app.CheckinStatus.SUCCESS)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(path)}):
+                checker.write_verification_summary()
+            self.assertFalse(path.exists())
 
     def test_invalid_json_and_non_object_json(self):
         for body in ([], None, "unexpected", {}):
